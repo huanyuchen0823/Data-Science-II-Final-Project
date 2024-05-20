@@ -1,0 +1,392 @@
+---
+title: "P8106 Data Science II Final Project R Code"
+author: "Huanyu Chen"
+output: 
+  pdf_document:
+    number_sections: true
+header-includes:
+  - \usepackage{titlesec}
+  - \titlespacing*{\section}{0pt}{*0.5}{*0.5}
+  - \titlespacing*{\subsection}{0pt}{*0.5}{*0.5}
+  - \titlespacing*{\subsubsection}{0pt}{*0.5}{*0.5}
+---
+
+```{r message = FALSE}
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(rpart.plot)
+library(pROC)
+library(randomForest)
+library(glmnet)
+library(MASS)
+library(gbm)
+library(pdp)
+library(gridExtra)
+```
+
+```{r}
+load("severity_test.RData")
+load("severity_training.RData")
+
+test_data <- test_data %>%
+  dplyr::select(-id) %>%
+  mutate(
+    gender = case_when(gender == 0 ~ "Female",
+                     gender == 1 ~"Male"),
+    race = case_when(race == 1 ~ "White",
+                     race == 2 ~ "Asian",
+                     race == 3 ~ "Black",
+                     race == 4 ~ "Hispanic"),
+  ) %>%
+  mutate(
+    gender = as.factor(gender),
+    diabetes = as.factor(diabetes),
+    hypertension = as.factor(hypertension),
+    vaccine = as.factor(vaccine),
+    severity = factor(severity, levels = c(1, 0), labels = c("Severe", "Not Severe"))
+  )
+
+training_data <- training_data %>%
+  dplyr::select(-id) %>%
+  mutate(
+    gender = case_when(gender == 0 ~ "Female",
+                     gender == 1 ~"Male"),
+    race = case_when(race == 1 ~ "White",
+                     race == 2 ~ "Asian",
+                     race == 3 ~ "Black",
+                     race == 4 ~ "Hispanic"),
+  ) %>%
+  mutate(
+    gender = as.factor(gender),
+    diabetes = as.factor(diabetes),
+    hypertension = as.factor(hypertension),
+    vaccine = as.factor(vaccine),
+    severity = factor(severity, levels = c(1, 0), labels = c("Severe", "Not Severe"))
+  )
+```
+
+# Exploratory Analysis and Data Visualization
+## Data Summary
+There are 13 potential predictors in this study: 7 of them are numeric variables (including `age`, `height`, `weight`, `bmi`, `SBP`, `LDL`, and `depression`), and the remaining 6 are categorical variables (including `gender`, `race`, `smoking`, `diabetes`, `hypertension` and `vaccine`). The response variable `severity` has two values: 1 stands for severe status (286 observations in this study) and 0 stands for non-severe status (514 observations).
+
+## Multivariate Density Plot of Age by Severity, Gender, and Race
+
+From **Figure 1**, it is evident that severity of COVID-19 tends to be higher among older individuals overall. However, specific trends vary across different demographic groups. Notably, the severity appears less pronounced among Female Black, Female Hispanic, and Male Asian populations. This suggests that factors beyond age, such as gender and race, may play a role in determining the severity of COVID-19 symptoms.
+
+```{r fig.height=3}
+ggplot(training_data, aes(x = age, fill = severity)) +
+    geom_density(alpha = 0.5) +
+    scale_fill_manual(values = c("blue", "red")) +
+    labs(title = "Figure 1: Multivariate Density Plot of Age by Severity, Gender, and Race") +
+    facet_wrap(~ gender + race, ncol = 4) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme_minimal()
+```
+
+## Severity Proportion by Vaccine Status
+From **Figure 2**, it is apparent that the severity of COVID-19 is lower among individuals who have received the vaccine. From our data, it can be reasonably concluded that vaccination is targeted at mitigating the symptoms of COVID-19.
+```{r fig.height=2}
+ggplot(training_data, aes(x = vaccine, fill = severity)) +
+  geom_bar(position = "fill") +
+  labs(title = "Figure 2: Severity Proportion by Vaccine Status") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_minimal()
+```
+
+# Model Training
+
+## Penalized Logistic Regression
+```{r warning=FALSE}
+training_data$severity <- make.names(training_data$severity)
+ctrl <- trainControl(method = "cv", number = 10,
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE)
+
+glmnGrid <- expand.grid(.alpha = seq(0, 1, length = 21),
+                        .lambda = exp(seq(-5, -1, length = 50)))
+
+set.seed(1)
+model.glmn <- train(x = training_data[1:13],
+                    y = training_data$severity,
+                    method = "glmnet",
+                    tuneGrid = glmnGrid,
+                    metric = "ROC",
+                    trControl = ctrl)
+```
+
+```{r}
+model.glmn$bestTune
+myCol <- rainbow(25)
+myPar <- list(superpose.symbol = list(col = myCol),
+              superpose.line = list(col = myCol))
+plot(model.glmn, par.settings = myPar, xTrans = function(x) log(x))
+coef(model.glmn$finalModel, model.glmn$bestTune$lambda)
+```
+
+```{r}
+predictions.glmn <- predict(model.glmn, newdata = test_data, type = "prob")
+predicted_probabilities.glmn <- predictions.glmn[, "Severe"]
+roc_curve.glmn <- roc(test_data$severity, predicted_probabilities.glmn)
+plot(roc_curve.glmn, main = "ROC Curve: Penalized Logistic Regression")
+text(0.1, 0.1, paste("AUC =", round(auc(roc_curve.glmn), 2)), adj = c(0.5, -0.5), cex = 1.2)
+auc(roc_curve.glmn)
+```
+
+
+## Linear Discriminant Analysis
+```{r warning=FALSE}
+lda.fit <- lda(severity~., data = training_data)
+plot(lda.fit)
+
+set.seed(1)
+lda_fit = train(x = model.matrix(severity ~ ., data = training_data)[, -1],
+                y = training_data$severity, method = "lda",
+                metric = "ROC",
+                trControl = ctrl)
+```
+
+```{r}
+lda.pred <- predict(lda.fit, newdata = test_data)
+lda.probs <- lda.pred$posterior[, "Severe"]
+roc_curve.lda <- roc(test_data$severity, lda.probs)
+plot(roc_curve.lda, main = "ROC Curve: Linear Discriminant Analysis")
+text(0.1, 0.1, paste("AUC =", round(auc(roc_curve.lda), 2)), adj = c(0.5, -0.5), cex = 1.2)
+auc(roc_curve.lda)
+```
+
+## Quadratic Discriminant Analysis
+```{r warning=FALSE}
+qda.fit <- qda(severity~., data = training_data)
+
+set.seed(1)
+qda_fit = train(x = model.matrix(severity ~ ., data = training_data)[, -1],
+                y = training_data$severity, method = "qda",
+                metric = "ROC",
+                trControl = ctrl)
+```
+
+```{r}
+qda.pred <- predict(qda.fit, newdata = test_data)
+qda.probs <- qda.pred$posterior[, "Severe"]
+roc_curve.qda <- roc(test_data$severity, qda.probs)
+plot(roc_curve.qda, main = "ROC Curve: Quadratic Discriminant Analysis")
+text(0.1, 0.1, paste("AUC =", round(auc(roc_curve.qda), 2)), adj = c(0.5, -0.5), cex = 1.2)
+auc(roc_curve.qda)
+```
+
+## Naive Bayes
+```{r warning=FALSE}
+nbGrid <- expand.grid(usekernel = c(FALSE, TRUE),
+                      fL = 1,
+                      adjust = seq(.2, 3, by = .2))
+
+set.seed(1)
+model.nb <- train(x = training_data[, 1:13],
+                  y = training_data$severity,
+                  method = "nb",
+                  tuneGrid = nbGrid,
+                  metric = "ROC",
+                  trControl = ctrl)
+plot(model.nb)
+```
+
+```{r warning=FALSE}
+predictions.nb <- predict(model.nb, newdata = test_data, type = "prob")
+predicted_probabilities.nb <- predictions.nb[, "Severe"]
+roc_curve.nb <- roc(test_data$severity, predicted_probabilities.nb)
+plot(roc_curve.nb, main = "ROC Curve: Naive Bayes")
+text(0.1, 0.1, paste("AUC =", round(auc(roc_curve.nb), 2)), adj = c(0.5, -0.5), cex = 1.2)
+auc(roc_curve.nb)
+```
+
+## Classification Trees
+```{r}
+ctrl <- trainControl(method = "cv",
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE)
+set.seed(1)
+rpart.fit <- train(severity ~ . ,
+                   training_data,
+                   method = "rpart",
+                   tuneGrid = data.frame(cp = exp(seq(-8,-2, length = 100))),
+                   trControl = ctrl)
+plot(rpart.fit, xTrans = log)
+rpart.plot(rpart.fit$finalModel)
+```
+
+```{r}
+predictions.rpart <- predict(rpart.fit, newdata = test_data, type = "prob")
+predicted_probabilities.rpart <- predictions.rpart[, "Severe"]
+roc_curve.rpart <- roc(test_data$severity, predicted_probabilities.rpart)
+plot(roc_curve.rpart, main = "ROC Curve: Classification Tree Model")
+text(0.1, 0.1, paste("AUC =", round(auc(roc_curve.rpart), 2)), adj = c(0.5, -0.5), cex = 1.2)
+auc(roc_curve.rpart)
+```
+
+## Random Forests
+```{r warning=FALSE}
+training_data$severity <- make.names(training_data$severity)
+ctrl <- trainControl(method = "cv",
+                     classProbs = TRUE,
+                     summaryFunction = twoClassSummary)
+
+rf.grid <- expand.grid(mtry = 1:6,
+                       splitrule = "gini",
+                       min.node.size = seq(from = 2, to = 16, by = 2))
+
+set.seed(1)
+rf.fit <- train(severity ~ . ,
+                training_data,
+                method = "ranger",
+                tuneGrid = rf.grid,
+                metric = "ROC",
+                trControl = ctrl)
+
+ggplot(rf.fit, highlight = TRUE)
+```
+
+```{r}
+rf.pred <- predict(rf.fit, newdata = test_data, type = "prob")[,1]
+roc_curve.rf <- roc(test_data$severity, rf.pred)
+plot(roc_curve.rf, main = "ROC Curve: Random Forests")
+text(0.1, 0.1, paste("AUC =", round(auc(roc_curve.rf), 2)), adj = c(0.5, -0.5), cex = 1.2)
+auc(roc_curve.rf)
+```
+
+## AdaBoost
+```{r}
+set.seed(1)
+gbmA.grid = expand.grid(n.trees = c(2000,3000,4000),
+                            interaction.depth = 1:8,
+                            shrinkage = c(0.001,0.002, 0.003),
+                            n.minobsinnode = 1)
+
+gbmA.fit <- train(severity ~ . ,
+                  training_data,
+                  tuneGrid = gbmA.grid,
+                  trControl = ctrl,
+                  method = "gbm",
+                  distribution = "adaboost",
+                  metric = "ROC",
+                  verbose = FALSE)
+
+ggplot(gbmA.fit, highlight = TRUE)
+```
+
+```{r}
+gbm.pred <- predict(gbmA.fit, newdata = test_data, type = "prob")[,1]
+roc_curve.gbm <- roc(test_data$severity, gbm.pred)
+plot(roc_curve.gbm, main = "ROC Curve: AdaBoost")
+text(0.1, 0.1, paste("AUC =", round(auc(roc_curve.gbm), 2)), adj = c(0.5, -0.5), cex = 1.2)
+auc(roc_curve.gbm)
+```
+
+## Support Vector Machine
+```{r}
+svmr.grid <- expand.grid(C = exp(seq(1, 7, len = 40)),
+                         sigma = exp(seq(-10, -2, len = 10)))
+
+set.seed(1)
+svmr.fit <- train(severity ~ . , data = training_data,
+                  method = "svmRadialSigma",
+                  tuneGrid = svmr.grid,
+                  trControl = ctrl)
+
+myCol <- rainbow(25)
+myPar <- list(superpose.symbol = list(col = myCol),
+superpose.line = list(col = myCol))
+plot(svmr.fit, highlight = TRUE, par.settings = myPar)
+```
+
+```{r}
+set.seed(1)
+svmr.fit2 <- train(severity ~ . , data = training_data,
+                   method = "svmRadialCost",
+                   tuneGrid = data.frame(C = exp(seq(-3, 3, len = 20))),
+                   trControl = ctrl)
+```
+
+```{r}
+test_data$severity <- make.names(test_data$severity)
+svmr.pred <- predict(svmr.fit, newdata = test_data, type = "prob")[,1]
+roc_curve.svmr <- roc(test_data$severity, svmr.pred)
+plot(roc_curve.svmr, main = "ROC Curve: Support Vector Machine (Cost & Sigma) ")
+text(0.1, 0.1, paste("AUC =", round(auc(roc_curve.svmr), 2)), adj = c(0.5, -0.5), cex = 1.2)
+auc(roc_curve.svmr)
+```
+
+```{r}
+svmr2.pred <- predict(svmr.fit2, newdata = test_data, type = "prob")[,1]
+roc_curve.svmr2 <- roc(test_data$severity, svmr2.pred)
+plot(roc_curve.svmr2, main = "ROC Curve: Support Vector Machine (Cost)")
+text(0.1, 0.1, paste("AUC =", round(auc(roc_curve.svmr2), 2)), adj = c(0.5, -0.5), cex = 1.2)
+auc(roc_curve.svmr2)
+```
+
+# Results
+
+## Model Comparasion
+
+```{r}
+resamp <- resamples(list(glmn = model.glmn, lda = lda_fit, qda = qda_fit,
+                         nb = model.nb, rpart = rpart.fit, rf = rf.fit,
+                         gbmA = gbmA.fit, svmr = svmr.fit))
+summary(resamp)
+bwplot(resamp, metric = "ROC")
+```
+
+
+## Model Performance
+
+```{r}
+roc_curves <- list(svmr1 = roc_curve.svmr,
+                   svmr2 = roc_curve.svmr2,
+                   gbm = roc_curve.gbm,
+                   rpart = roc_curve.rpart,
+                   nb = roc_curve.nb,
+                   qda = roc_curve.qda,
+                   lda = roc_curve.lda,
+                   glmn = roc_curve.glmn)
+
+plot(0, 0, type = "n", xlim = c(1, 0), ylim = c(0, 1), 
+     xlab = "False Positive Rate", ylab = "True Positive Rate",
+     main = "ROC Curves")
+
+colors <- colorRampPalette(colors = c("cyan","blue"))(10)
+
+for (i in seq_along(roc_curves)) {
+  perf <- roc_curves[[i]]
+  auc_val <- round(auc(perf), 2)
+  col <- colors[i]
+  lines(perf, col = col, lwd = 2)
+  text(0.25, 0.8 - 0.1 * i, paste(names(roc_curves)[i], "AUC =", auc_val), 
+       adj = c(0, 0), col = col, cex = 0.8)
+}
+```
+
+Through model comparasion using the resampling method and evaluating model performance with ROC curves, we have found that the Boosting model demonstrates superior performance. Consequently, we will proceed with utilizing the Boosting model for further analysis and predictions.
+
+# Conclusion
+
+## Variable Importance
+
+```{r}
+plot_gbm <- summary(gbmA.fit$finalModel, las = 1, cBars = 10, cex.names = 0.6)
+title("Variable Importance Plot")
+plot_gbm
+```
+
+## Partial Dependence Plot
+```{r}
+p1 <- partial(gbmA.fit, pred.var = "SBP",
+        plot = TRUE, rug = TRUE,
+        plot.engine = "ggplot") + ggtitle("Partial Dependence Plot: SBP")
+p2 <- partial(gbmA.fit, pred.var = "height",
+        plot = TRUE, rug = TRUE,
+        plot.engine = "ggplot") + ggtitle("Partial Dependence Plot: Height")
+
+gridExtra::grid.arrange(p1, p2, nrow = 1)
+```
+
+
